@@ -1,5 +1,6 @@
-pyrogram
+pyrogram==1.4.16
 tgcrypto
-py-tgcalls
+py-tgcalls==0.9.7
 yt-dlp
 Pillow
+
