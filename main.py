@@ -1,69 +1,81 @@
 import os
 import json
-import time
 import asyncio
+import time
 from pathlib import Path
 from collections import deque
 
-import yt_dlp
-from PIL import Image, ImageDraw, ImageFont
-
-try:
-    import turtle
-    TURTLE_AVAILABLE = True
-except Exception:
-    TURTLE_AVAILABLE = False
-
-from pyrogram import Client, filters, idle
-from pyrogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+import pyrogram
+from pyrogram import Client, filters
+from pyrogram.idle import idle
+from pyrogram.types import Message, CallbackQuery
 from pyrogram.enums import ChatMemberStatus
+from pyrogram.errors import RPCError
 
-# IMPORTANT:
-# pip package = py-tgcalls
-# Python import = pytgcalls
+# ============================================================
+# PyTgCalls / Pyrogram compatibility fix
+# PyTgCalls currently imports GroupcallForbidden,
+# while Pyrogram exposes GroupCallForbidden.
+# ============================================================
+
+if hasattr(pyrogram.errors, "GroupCallForbidden") and not hasattr(
+    pyrogram.errors, "GroupcallForbidden"
+):
+    pyrogram.errors.GroupcallForbidden = pyrogram.errors.GroupCallForbidden
+
+
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as tgcall_filters
-from pytgcalls.types import MediaStream
+from pytgcalls.types import MediaStream, StreamEnded
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-API_ID = int(os.getenv("API_ID", "12345678"))
-API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-GROUP_ID = int(
-    os.getenv("GROUP_ID", "-1001234567890")
-)
+GROUP_ID = int(os.getenv("GROUP_ID", "0"))
 
-BRAND = "@epic_india"
+BRAND = os.getenv("BRAND", "@epic_india")
 
 DATA_DIR = Path("epic_bot_data")
 DATA_DIR.mkdir(exist_ok=True)
-
-DOWNLOAD_DIR = DATA_DIR / "downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-THUMB_DIR = DATA_DIR / "thumbnails"
-THUMB_DIR.mkdir(exist_ok=True)
-
-LOADING_DIR = DATA_DIR / "loading"
-LOADING_DIR.mkdir(exist_ok=True)
 
 AUTH_FILE = DATA_DIR / "authorized.json"
 
 
 # ============================================================
-# PYROGRAM + PYTGCalls
+# VALIDATION
 # ============================================================
 
+if not API_ID:
+    raise RuntimeError("API_ID is missing")
+
+if not API_HASH:
+    raise RuntimeError("API_HASH is missing")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+
+if not GROUP_ID:
+    raise RuntimeError("GROUP_ID is missing")
+
+if not SESSION_STRING:
+    raise RuntimeError(
+        "SESSION_STRING is missing. "
+        "A user session is required for VC playback."
+    )
+
+
+# ============================================================
+# TELEGRAM CLIENTS
+# ============================================================
+
+# Bot account = commands/buttons
 app = Client(
     "epic_india_music_bot",
     api_id=API_ID,
@@ -71,8 +83,16 @@ app = Client(
     bot_token=BOT_TOKEN,
 )
 
-# py-tgcalls package -> pytgcalls Python module
-call_py = PyTgCalls(app)
+# User account = Voice Chat playback
+user_app = Client(
+    "epic_india_music_user",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+)
+
+# PyTgCalls attaches to USER client
+call_py = PyTgCalls(user_app)
 
 
 # ============================================================
@@ -84,10 +104,12 @@ queue = deque()
 current_track = None
 is_playing = False
 
-authorized_users = set()
-admin_cache = set()
-
 play_lock = asyncio.Lock()
+
+authorized_users = set()
+
+downloads = Path("downloads")
+downloads.mkdir(exist_ok=True)
 
 
 # ============================================================
@@ -97,34 +119,22 @@ play_lock = asyncio.Lock()
 def load_auth():
     global authorized_users
 
-    if not AUTH_FILE.exists():
-        authorized_users = set()
-        save_auth()
-        return
-
     try:
-        data = json.loads(
-            AUTH_FILE.read_text(
-                encoding="utf-8"
-            )
-        )
-
-        authorized_users = {
-            int(x) for x in data
-        }
-
-    except Exception:
+        if AUTH_FILE.exists():
+            data = json.loads(AUTH_FILE.read_text())
+            authorized_users = set(int(x) for x in data)
+    except Exception as e:
+        print("AUTH LOAD ERROR:", e)
         authorized_users = set()
 
 
 def save_auth():
-    AUTH_FILE.write_text(
-        json.dumps(
-            sorted(authorized_users),
-            indent=2
-        ),
-        encoding="utf-8",
-    )
+    try:
+        AUTH_FILE.write_text(
+            json.dumps(sorted(list(authorized_users)), indent=2)
+        )
+    except Exception as e:
+        print("AUTH SAVE ERROR:", e)
 
 
 load_auth()
@@ -134,787 +144,174 @@ load_auth()
 # HELPERS
 # ============================================================
 
-def allowed_group(message: Message):
-    return (
-        message.chat
-        and message.chat.id == GROUP_ID
-    )
-
-
-def user_name(user):
-    if not user:
-        return "Unknown"
-
-    name = " ".join(
-        x for x in [
-            user.first_name,
-            user.last_name
-        ]
-        if x
-    ).strip()
-
-    return (
-        name
-        or user.username
-        or str(user.id)
-    )
-
-
-def user_tag(user):
-    if user.username:
-        return f"@{user.username}"
-
-    return str(user.id)
-
-
-async def refresh_admins():
-    global admin_cache
-
-    admin_cache = set()
-
+async def is_group_admin(user_id: int) -> bool:
     try:
-        async for member in app.get_chat_members(
-            GROUP_ID
-        ):
-            if member.status in (
-                ChatMemberStatus.OWNER,
-                ChatMemberStatus.ADMINISTRATOR,
-            ):
-                admin_cache.add(
-                    member.user.id
-                )
+        member = await app.get_chat_member(GROUP_ID, user_id)
 
-    except Exception as e:
-        print(
-            "Admin refresh error:",
-            e
-        )
-
-    return admin_cache
-
-
-async def is_admin(user_id: int):
-    if user_id in admin_cache:
-        return True
-
-    try:
-        member = await app.get_chat_member(
-            GROUP_ID,
-            user_id
-        )
-
-        if member.status in (
+        return member.status in (
             ChatMemberStatus.OWNER,
             ChatMemberStatus.ADMINISTRATOR,
-        ):
-            admin_cache.add(user_id)
-            return True
+        )
 
     except Exception:
-        pass
-
-    return False
-
-
-async def is_authorized(user_id: int):
-    if await is_admin(user_id):
-        return True
-
-    return user_id in authorized_users
-
-
-async def check_auth(message: Message):
-    if not message.from_user:
         return False
 
-    if await is_authorized(
-        message.from_user.id
-    ):
+
+async def is_authorized(user_id: int) -> bool:
+    if user_id in authorized_users:
         return True
 
-    await message.reply_text(
-        "❌ You are not authorized.\n\n"
-        f"{BRAND}"
-    )
-
-    return False
+    return await is_group_admin(user_id)
 
 
-async def resolve_user(value):
-    value = value.strip()
+async def ensure_group(message: Message) -> bool:
+    if not message.chat:
+        return False
 
-    if value.startswith("@"):
-        value = value[1:]
+    if message.chat.id != GROUP_ID:
+        await message.reply_text(
+            "❌ This command can only be used in the music group."
+        )
+        return False
 
-    if value.isdigit():
-        try:
-            return await app.get_users(
-                int(value)
-            )
-        except Exception:
-            return None
+    return True
 
+
+async def get_user_name(user_id: int) -> str:
     try:
-        return await app.get_users(value)
+        user = await app.get_users(user_id)
+
+        if user.username:
+            return f"@{user.username}"
+
+        return user.first_name or str(user_id)
+
     except Exception:
-        return None
-
-
-# ============================================================
-# FONT
-# ============================================================
-
-def get_font(size):
-    fonts = [
-        "/usr/share/fonts/truetype/dejavu/"
-        "DejaVuSans-Bold.ttf",
-
-        "/usr/share/fonts/truetype/liberation2/"
-        "LiberationSans-Bold.ttf",
-
-        "arial.ttf",
-    ]
-
-    for font in fonts:
-        try:
-            return ImageFont.truetype(
-                font,
-                size
-            )
-        except Exception:
-            continue
-
-    return ImageFont.load_default()
-
-
-# ============================================================
-# TURTLE / PIL LOADING GRAPHIC
-# ============================================================
-
-def create_pil_loading(path):
-    width = 900
-    height = 500
-
-    img = Image.new(
-        "RGB",
-        (width, height),
-        "#070711"
-    )
-
-    draw = ImageDraw.Draw(img)
-
-    for y in range(height):
-        r = int(
-            7 + (y / height) * 20
-        )
-        g = 7
-        b = int(
-            17 + (y / height) * 35
-        )
-
-        draw.line(
-            [(0, y), (width, y)],
-            fill=(r, g, b)
-        )
-
-    for radius, color in [
-        (190, "#8A2BE2"),
-        (145, "#FF1493"),
-        (100, "#00D9FF"),
-    ]:
-        draw.ellipse(
-            (
-                450 - radius,
-                250 - radius,
-                450 + radius,
-                250 + radius
-            ),
-            outline=color,
-            width=5
-        )
-
-    big = get_font(55)
-    mid = get_font(35)
-    small = get_font(18)
-
-    def center(text, y, font, color):
-        box = draw.textbbox(
-            (0, 0),
-            text,
-            font=font
-        )
-
-        w = box[2] - box[0]
-
-        draw.text(
-            ((width - w) / 2, y),
-            text,
-            font=font,
-            fill=color
-        )
-
-    center(
-        "EPIC",
-        175,
-        big,
-        "#FFFFFF"
-    )
-
-    center(
-        "INDIA",
-        245,
-        mid,
-        "#FF1493"
-    )
-
-    center(
-        "PREPARING YOUR REQUEST...",
-        315,
-        small,
-        "#00D9FF"
-    )
-
-    img.save(path)
-
-    return path
-
-
-def create_turtle_graphic(path):
-    """
-    Turtle attempt.
-    Falls back to PIL automatically on headless VPS.
-    """
-
-    if not TURTLE_AVAILABLE:
-        return create_pil_loading(path)
-
-    try:
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-
-        canvas = tk.Canvas(
-            root,
-            width=900,
-            height=500,
-            bg="#070711",
-            highlightthickness=0
-        )
-
-        canvas.pack()
-
-        screen = turtle.TurtleScreen(
-            canvas
-        )
-
-        screen.bgcolor("#070711")
-
-        t = turtle.RawTurtle(
-            screen
-        )
-
-        t.hideturtle()
-        t.speed(0)
-        t.penup()
-
-        for radius, color in [
-            (190, "#8A2BE2"),
-            (145, "#FF1493"),
-            (100, "#00D9FF"),
-        ]:
-            t.goto(
-                0,
-                -radius
-            )
-
-            t.pendown()
-            t.pencolor(color)
-            t.circle(radius)
-            t.penup()
-
-        t.goto(0, 35)
-        t.color("#FFFFFF")
-
-        t.write(
-            "EPIC",
-            align="center",
-            font=(
-                "Arial",
-                48,
-                "bold"
-            )
-        )
-
-        t.goto(0, -30)
-        t.color("#FF1493")
-
-        t.write(
-            "INDIA",
-            align="center",
-            font=(
-                "Arial",
-                34,
-                "bold"
-            )
-        )
-
-        t.goto(0, -90)
-        t.color("#00D9FF")
-
-        t.write(
-            "PREPARING YOUR REQUEST...",
-            align="center",
-            font=(
-                "Arial",
-                14,
-                "bold"
-            )
-        )
-
-        root.update()
-
-        ps = canvas.postscript(
-            colormode="color"
-        )
-
-        ps_file = path.with_suffix(
-            ".ps"
-        )
-
-        ps_file.write_text(
-            ps,
-            encoding="latin-1"
-        )
-
-        root.destroy()
-
-        try:
-            img = Image.open(ps_file)
-            img.save(path)
-            ps_file.unlink(
-                missing_ok=True
-            )
-
-            return path
-
-        except Exception:
-            ps_file.unlink(
-                missing_ok=True
-            )
-
-            return create_pil_loading(
-                path
-            )
-
-    except Exception as e:
-        print(
-            "Turtle unavailable:",
-            e
-        )
-
-        return create_pil_loading(
-            path
-        )
-
-
-LOADING_IMAGE = (
-    LOADING_DIR /
-    "loading.png"
-)
-
-if not LOADING_IMAGE.exists():
-    create_turtle_graphic(
-        LOADING_IMAGE
-    )
-
-
-# ============================================================
-# REQUEST THUMBNAIL
-# ============================================================
-
-def make_thumbnail(
-    title,
-    requester,
-    name
-):
-    width = 1280
-    height = 720
-
-    img = Image.new(
-        "RGB",
-        (width, height),
-        "#08080F"
-    )
-
-    draw = ImageDraw.Draw(img)
-
-    # Background
-    for y in range(height):
-        ratio = y / height
-
-        r = int(
-            8 + 25 * ratio
-        )
-
-        g = int(
-            8 + 4 * ratio
-        )
-
-        b = int(
-            20 + 30 * ratio
-        )
-
-        draw.line(
-            [(0, y), (width, y)],
-            fill=(r, g, b)
-        )
-
-    # Neon circles
-    draw.ellipse(
-        (-150, -150, 450, 450),
-        fill="#17102E",
-        outline="#8A2BE2",
-        width=8
-    )
-
-    draw.ellipse(
-        (850, 330, 1450, 930),
-        fill="#211025",
-        outline="#FF1493",
-        width=8
-    )
-
-    logo_font = get_font(90)
-    title_font = get_font(46)
-    user_font = get_font(32)
-    small_font = get_font(26)
-
-    def center(
-        text,
-        y,
-        font,
-        color
-    ):
-        box = draw.textbbox(
-            (0, 0),
-            text,
-            font=font
-        )
-
-        w = box[2] - box[0]
-
-        draw.text(
-            (
-                (width - w) / 2,
-                y
-            ),
-            text,
-            font=font,
-            fill=color
-        )
-
-    center(
-        BRAND,
-        80,
-        logo_font,
-        "#FFFFFF"
-    )
-
-    draw.rounded_rectangle(
-        (
-            120,
-            220,
-            1160,
-            228
-        ),
-        radius=4,
-        fill="#00D9FF"
-    )
-
-    center(
-        title[:65],
-        280,
-        title_font,
-        "#FFFFFF"
-    )
-
-    center(
-        f"Requested by {requester[:45]}",
-        385,
-        user_font,
-        "#00D9FF"
-    )
-
-    center(
-        name[:45],
-        445,
-        small_font,
-        "#C9C9D8"
-    )
-
-    center(
-        "MUSIC REQUEST",
-        555,
-        small_font,
-        "#FF1493"
-    )
-
-    output = (
-        THUMB_DIR /
-        f"request_{int(time.time() * 1000)}.jpg"
-    )
-
-    img.save(
-        output,
-        "JPEG",
-        quality=94
-    )
-
-    return output
+        return str(user_id)
 
 
 # ============================================================
 # YOUTUBE SEARCH
 # ============================================================
 
-def youtube_search(query):
-    if (
-        "youtube.com" in query
-        or "youtu.be" in query
-    ):
-        search = query
-    else:
-        search = (
-            f"ytsearch1:{query}"
-        )
+def youtube_search(query: str):
+    import yt_dlp
+
+    # Direct URL
+    if query.startswith("http://") or query.startswith("https://"):
+        return {
+            "title": query,
+            "url": query,
+            "webpage_url": query,
+            "duration": 0,
+            "thumbnail": None,
+        }
 
     options = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "noplaylist": True,
+        "extract_flat": True,
     }
 
-    with yt_dlp.YoutubeDL(
-        options
-    ) as ydl:
-
-        info = ydl.extract_info(
-            search,
-            download=False
+    with yt_dlp.YoutubeDL(options) as ydl:
+        result = ydl.extract_info(
+            f"ytsearch1:{query}",
+            download=False,
         )
 
-    if not info:
+    entries = result.get("entries") or []
+
+    if not entries:
         return None
 
-    if "entries" in info:
-        entries = list(
-            info["entries"]
-        )
-
-        if not entries:
-            return None
-
-        info = entries[0]
+    item = entries[0]
 
     return {
-        "title": info.get(
-            "title",
-            query
-        ),
-        "url": info.get(
-            "webpage_url"
-        ),
+        "title": item.get("title") or "Unknown",
+        "url": item.get("webpage_url") or item.get("url"),
+        "webpage_url": item.get("webpage_url") or item.get("url"),
+        "duration": item.get("duration") or 0,
+        "thumbnail": item.get("thumbnail"),
     }
 
 
-# ============================================================
-# DOWNLOAD
-# ============================================================
+async def search_youtube(query: str):
+    loop = asyncio.get_running_loop()
 
-def download_media(
-    url,
-    video=False
-):
-    if video:
-        output = str(
-            DOWNLOAD_DIR /
-            "%(id)s.%(ext)s"
-        )
-
-        options = {
-            "format": (
-                "bestvideo[height<=720]"
-                "+bestaudio/"
-                "best[height<=720]/best"
-            ),
-            "outtmpl": output,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "merge_output_format": "mp4",
-        }
-
-    else:
-        output = str(
-            DOWNLOAD_DIR /
-            "%(id)s.%(ext)s"
-        )
-
-        options = {
-            "format": "bestaudio/best",
-            "outtmpl": output,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        }
-
-    with yt_dlp.YoutubeDL(
-        options
-    ) as ydl:
-
-        info = ydl.extract_info(
-            url,
-            download=True
-        )
-
-        prepared = Path(
-            ydl.prepare_filename(info)
-        )
-
-    if video:
-        candidates = [
-            prepared.with_suffix(".mp4"),
-            prepared,
-            prepared.with_suffix(".mkv"),
-            prepared.with_suffix(".webm"),
-        ]
-    else:
-        candidates = [
-            prepared.with_suffix(".mp3"),
-            prepared.with_suffix(".m4a"),
-            prepared.with_suffix(".webm"),
-            prepared,
-        ]
-
-    for file in candidates:
-        if file.exists():
-            return str(file)
-
-    stem = prepared.stem
-
-    for file in DOWNLOAD_DIR.glob(
-        f"{stem}*"
-    ):
-        if file.is_file():
-            return str(file)
-
-    raise FileNotFoundError(
-        "Downloaded file not found."
+    return await loop.run_in_executor(
+        None,
+        youtube_search,
+        query,
     )
 
 
 # ============================================================
-# LOADING
+# TIME FORMAT
 # ============================================================
 
-async def loading_animation(text):
+def format_duration(seconds):
     try:
-        msg = await app.send_photo(
-            GROUP_ID,
-            str(LOADING_IMAGE),
-            caption=(
-                f"⏳ **{text}**\n\n"
-                f"{BRAND}"
-            )
-        )
+        seconds = int(seconds)
+    except Exception:
+        return "Unknown"
 
-        await asyncio.sleep(3)
+    if seconds <= 0:
+        return "Unknown"
 
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
 
-    except Exception as e:
-        print(
-            "Loading error:",
-            e
-        )
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+
+    return f"{m}:{s:02d}"
 
 
 # ============================================================
-# TRACK PLAY
+# PLAYBACK
 # ============================================================
 
 async def play_track(track):
-    global current_track
-    global is_playing
+    global current_track, is_playing
 
     current_track = track
     is_playing = True
 
+    title = track["title"]
+    url = track["url"]
+    video = track.get("video", False)
+
     try:
-        media = await asyncio.to_thread(
-            download_media,
-            track["url"],
-            track["video"]
-        )
+        print("PLAYING:", title)
 
-        track["file"] = media
-
-        if track["video"]:
-            stream = MediaStream(
-                media
-            )
+        if video:
+            stream = MediaStream(url)
         else:
             stream = MediaStream(
-                media,
-                video_flags=(
-                    MediaStream.Flags.IGNORE
-                )
+                url,
+                video_flags=MediaStream.Flags.IGNORE,
             )
 
-        # py-tgcalls current API
-        call_py.play(
+        await call_py.play(
             GROUP_ID,
-            stream
+            stream,
         )
 
-        print(
-            "Playing:",
-            track["title"]
-        )
+        print("VC PLAY SUCCESS:", title)
 
     except Exception as e:
-        print(
-            "Playback error:",
-            repr(e)
-        )
+        print("PLAY ERROR:", repr(e))
 
         is_playing = False
         current_track = None
 
-        await cleanup_track(
-            track
-        )
-
         try:
             await app.send_message(
                 GROUP_ID,
-                (
-                    "❌ **Playback failed.**\n\n"
-                    f"🎵 `{track['title']}`\n\n"
-                    f"{BRAND}"
-                )
+                f"❌ **Playback failed**\n\n"
+                f"🎵 `{title}`\n"
+                f"⚠️ `{str(e)[:500]}`",
             )
         except Exception:
             pass
@@ -923,832 +320,656 @@ async def play_track(track):
 
 
 async def play_next():
-    global is_playing
-    global current_track
+    global current_track, is_playing
 
     async with play_lock:
-        if is_playing:
-            return
 
-        if not queue:
+        if queue:
+            next_track = queue.popleft()
+            await play_track(next_track)
+
+        else:
             current_track = None
-            return
+            is_playing = False
 
-        track = queue.popleft()
-
-        await play_track(
-            track
-        )
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-async def cleanup_track(track):
-    file = track.get("file")
-
-    if not file:
-        return
-
-    try:
-        path = Path(file)
-
-        if path.exists():
-            path.unlink()
-
-    except Exception as e:
-        print(
-            "Cleanup error:",
-            e
-        )
+            try:
+                await call_py.leave_call(GROUP_ID)
+            except Exception:
+                pass
 
 
 # ============================================================
 # STREAM END
 # ============================================================
 
-# py-tgcalls provides stream-end filtering.
-# The exact update object is version dependent, so keep this
-# handler defensive.
+@call_py.on_update(tgcall_filters.stream_end())
+async def stream_end_handler(_, update: StreamEnded):
+    global current_track, is_playing
 
-try:
+    print("STREAM ENDED:", update.chat_id)
 
-    @call_py.on_update(
-        tgcall_filters.stream_end()
-    )
-    async def on_stream_end(
-        _,
-        update
-    ):
-        global current_track
-        global is_playing
-
-        try:
-            if update.chat_id != GROUP_ID:
-                return
-        except Exception:
-            pass
-
-        old = current_track
-
-        current_track = None
-        is_playing = False
-
-        if old:
-            await cleanup_track(
-                old
-            )
-
-        await play_next()
-
-except Exception as e:
-    print(
-        "Stream-end handler registration:",
-        e
-    )
-
-
-# ============================================================
-# REQUEST CARD
-# ============================================================
-
-async def send_request_card(
-    track
-):
-    thumb = make_thumbnail(
-        track["title"],
-        track["username"],
-        track["name"]
-    )
-
-    if track["video"]:
-        icon = "🎬"
-    else:
-        icon = "🎵"
-
-    caption = (
-        f"{icon} **{track['title']}**\n\n"
-        f"👤 Requested by: "
-        f"{track['username']}\n"
-        f"📝 Name: {track['name']}\n\n"
-        f"{BRAND}"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "⏭ Skip",
-                    callback_data="music_skip"
-                ),
-                InlineKeyboardButton(
-                    "⏹ Stop",
-                    callback_data="music_stop"
-                ),
-            ]
-        ]
-    )
-
-    msg = await app.send_photo(
-        GROUP_ID,
-        str(thumb),
-        caption=caption,
-        reply_markup=keyboard
-    )
-
-    track["reply_message_id"] = msg.id
-
-    return msg
-
-
-# ============================================================
-# /PLAY
-# ============================================================
-
-@app.on_message(
-    filters.command(
-        "play",
-        prefixes="/"
-    )
-)
-async def play_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
+    if update.chat_id != GROUP_ID:
         return
-
-    if not await check_auth(
-        message
-    ):
-        return
-
-    parts = message.text.split(
-        maxsplit=1
-    )
-
-    if len(parts) < 2:
-        await message.reply_text(
-            "Usage: `/play song name`\n\n"
-            f"{BRAND}"
-        )
-        return
-
-    query = parts[1].strip()
-
-    # Delete original /play command.
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    # 3-second graphic.
-    await loading_animation(
-        "Preparing your song..."
-    )
-
-    try:
-        result = await asyncio.to_thread(
-            youtube_search,
-            query
-        )
-
-        if not result:
-            await client.send_message(
-                GROUP_ID,
-                (
-                    "❌ Song not found.\n\n"
-                    f"{BRAND}"
-                )
-            )
-            return
-
-        user = message.from_user
-
-        track = {
-            "title": result["title"],
-            "url": result["url"],
-            "video": False,
-            "user_id": user.id,
-            "username": user_tag(user),
-            "name": user_name(user),
-            "request_message_id": message.id,
-            "reply_message_id": None,
-            "file": None,
-        }
-
-        await send_request_card(
-            track
-        )
-
-        queue.append(track)
-
-        if not is_playing:
-            await play_next()
-
-    except Exception as e:
-        print(
-            "/play error:",
-            repr(e)
-        )
-
-        await client.send_message(
-            GROUP_ID,
-            (
-                "❌ **Request failed.**\n\n"
-                f"`{e}`\n\n"
-                f"{BRAND}"
-            )
-        )
-
-
-# ============================================================
-# /VPLAY
-# ============================================================
-
-@app.on_message(
-    filters.command(
-        "vplay",
-        prefixes="/"
-    )
-)
-async def vplay_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
-        return
-
-    if not await check_auth(
-        message
-    ):
-        return
-
-    parts = message.text.split(
-        maxsplit=1
-    )
-
-    if len(parts) < 2:
-        await message.reply_text(
-            "Usage: `/vplay video name`\n\n"
-            f"{BRAND}"
-        )
-        return
-
-    query = parts[1].strip()
-
-    # Delete original /vplay command.
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    await loading_animation(
-        "Preparing your video..."
-    )
-
-    try:
-        result = await asyncio.to_thread(
-            youtube_search,
-            query
-        )
-
-        if not result:
-            await client.send_message(
-                GROUP_ID,
-                (
-                    "❌ Video not found.\n\n"
-                    f"{BRAND}"
-                )
-            )
-            return
-
-        user = message.from_user
-
-        track = {
-            "title": result["title"],
-            "url": result["url"],
-            "video": True,
-            "user_id": user.id,
-            "username": user_tag(user),
-            "name": user_name(user),
-            "request_message_id": message.id,
-            "reply_message_id": None,
-            "file": None,
-        }
-
-        await send_request_card(
-            track
-        )
-
-        queue.append(track)
-
-        if not is_playing:
-            await play_next()
-
-    except Exception as e:
-        print(
-            "/vplay error:",
-            repr(e)
-        )
-
-        await client.send_message(
-            GROUP_ID,
-            (
-                "❌ **Video request failed.**\n\n"
-                f"`{e}`\n\n"
-                f"{BRAND}"
-            )
-        )
-
-
-# ============================================================
-# /OPEN
-# ============================================================
-
-@app.on_message(
-    filters.command(
-        "open",
-        prefixes="/"
-    )
-)
-async def open_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
-        return
-
-    if not await check_auth(
-        message
-    ):
-        return
-
-    await message.reply_text(
-        (
-            "🎙 **VC mode ready.**\n\n"
-            "Start a Telegram Voice Chat in the group, "
-            "then use `/play` or `/vplay`.\n\n"
-            f"{BRAND}"
-        )
-    )
-
-
-# ============================================================
-# STOP
-# ============================================================
-
-async def stop_all():
-    global current_track
-    global is_playing
-
-    try:
-        call_py.leave_call(
-            GROUP_ID
-        )
-    except Exception as e:
-        print(
-            "leave_call:",
-            e
-        )
-
-    old = current_track
 
     current_track = None
     is_playing = False
-
-    if old:
-        await cleanup_track(
-            old
-        )
-
-    while queue:
-        track = queue.popleft()
-
-        await cleanup_track(
-            track
-        )
-
-
-@app.on_message(
-    filters.command(
-        "stop",
-        prefixes="/"
-    )
-)
-async def stop_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
-        return
-
-    if not await check_auth(
-        message
-    ):
-        return
-
-    await stop_all()
-
-    await message.reply_text(
-        (
-            "⏹ **VC stopped. Queue cleared.**\n\n"
-            f"{BRAND}"
-        )
-    )
-
-
-# ============================================================
-# SKIP
-# ============================================================
-
-async def skip_current():
-    global current_track
-    global is_playing
-
-    old = current_track
-
-    try:
-        call_py.stop(
-            GROUP_ID
-        )
-    except Exception as e:
-        print(
-            "stop error:",
-            e
-        )
-
-    current_track = None
-    is_playing = False
-
-    if old:
-        await cleanup_track(
-            old
-        )
 
     await play_next()
 
 
-@app.on_message(
-    filters.command(
-        "skip",
-        prefixes="/"
+# ============================================================
+# REQUEST MESSAGE
+# ============================================================
+
+async def send_request_card(message: Message, track, position=None):
+
+    title = track["title"]
+    duration = format_duration(track.get("duration", 0))
+
+    text = (
+        "🎵 **EPIC INDIA MUSIC BOT**\n\n"
+        f"🎶 **{title}**\n"
+        f"⏱ `{duration}`\n"
     )
-)
-async def skip_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
-        return
 
-    if not await check_auth(
-        message
-    ):
-        return
+    if position is not None:
+        text += f"📌 Queue Position: `{position}`\n"
 
-    await skip_current()
+    text += f"\n👤 Requested by {await get_user_name(message.from_user.id)}"
 
     await message.reply_text(
-        (
-            "⏭ **Skipped.**\n\n"
-            f"{BRAND}"
-        )
+        text,
+        disable_web_page_preview=True,
     )
 
 
 # ============================================================
-# BUTTON SKIP
+# /start
 # ============================================================
 
-@app.on_callback_query(
-    filters.regex(
-        "^music_skip$"
+@app.on_message(filters.command("start"))
+async def start_command(_, message: Message):
+
+    await message.reply_text(
+        "🎧 **EPIC INDIA MUSIC BOT**\n\n"
+        "🎵 `/play song name` - Play audio\n"
+        "🎬 `/vplay song name` - Play video\n"
+        "⏭ `/skip` - Skip current\n"
+        "⏹ `/stop` - Stop playback\n"
+        "⏸ `/pause` - Pause\n"
+        "▶️ `/resume` - Resume\n\n"
+        "🔐 Admin commands:\n"
+        "`/auth user_id`\n"
+        "`/unauth user_id`\n"
+        "`/reload`\n"
+        "`/purge`"
     )
-)
-async def button_skip(
-    client,
-    query: CallbackQuery
-):
-    if (
-        not query.message
-        or query.message.chat.id != GROUP_ID
-    ):
+
+
+# ============================================================
+# /play
+# ============================================================
+
+@app.on_message(filters.command("play"))
+async def play_command(_, message: Message):
+
+    if not await ensure_group(message):
         return
 
-    if not await is_authorized(
-        query.from_user.id
-    ):
-        await query.answer(
-            "You are not authorized.",
-            show_alert=True
+    if not message.from_user:
+        return
+
+    if not await is_authorized(message.from_user.id):
+        await message.reply_text(
+            "❌ You are not authorized to use the music player."
         )
         return
 
-    await query.answer(
-        "Skipping..."
-    )
+    if len(message.command) < 2:
+        await message.reply_text(
+            "🎵 Usage:\n`/play song name or YouTube URL`"
+        )
+        return
 
-    await skip_current()
+    query = message.text.split(None, 1)[1].strip()
+
+    wait = await message.reply_text(
+        "🔎 Searching..."
+    )
 
     try:
-        await query.message.edit_caption(
-            "⏭ **Skipped**\n\n"
-            f"{BRAND}"
+        track = await search_youtube(query)
+
+        if not track:
+            await wait.edit_text(
+                "❌ Song not found."
+            )
+            return
+
+        track["video"] = False
+        track["requested_by"] = message.from_user.id
+
+        if is_playing:
+            queue.append(track)
+
+            position = len(queue)
+
+            await wait.delete()
+
+            await send_request_card(
+                message,
+                track,
+                position,
+            )
+
+        else:
+            await wait.edit_text(
+                f"🎵 **Starting:**\n{track['title']}"
+            )
+
+            await play_track(track)
+
+    except Exception as e:
+        print("PLAY COMMAND ERROR:", repr(e))
+
+        await wait.edit_text(
+            f"❌ Error:\n`{str(e)[:700]}`"
         )
+
+
+# ============================================================
+# /vplay
+# ============================================================
+
+@app.on_message(filters.command("vplay"))
+async def vplay_command(_, message: Message):
+
+    if not await ensure_group(message):
+        return
+
+    if not message.from_user:
+        return
+
+    if not await is_authorized(message.from_user.id):
+        await message.reply_text(
+            "❌ You are not authorized to use the music player."
+        )
+        return
+
+    if len(message.command) < 2:
+        await message.reply_text(
+            "🎬 Usage:\n`/vplay video name or YouTube URL`"
+        )
+        return
+
+    query = message.text.split(None, 1)[1].strip()
+
+    wait = await message.reply_text(
+        "🔎 Searching video..."
+    )
+
+    try:
+        track = await search_youtube(query)
+
+        if not track:
+            await wait.edit_text(
+                "❌ Video not found."
+            )
+            return
+
+        track["video"] = True
+        track["requested_by"] = message.from_user.id
+
+        if is_playing:
+            queue.append(track)
+
+            await wait.delete()
+
+            await send_request_card(
+                message,
+                track,
+                len(queue),
+            )
+
+        else:
+            await wait.edit_text(
+                f"🎬 **Starting video:**\n{track['title']}"
+            )
+
+            await play_track(track)
+
+    except Exception as e:
+        print("VPLAY ERROR:", repr(e))
+
+        await wait.edit_text(
+            f"❌ Error:\n`{str(e)[:700]}`"
+        )
+
+
+# ============================================================
+# /open
+# ============================================================
+
+@app.on_message(filters.command("open"))
+async def open_command(_, message: Message):
+
+    if not await ensure_group(message):
+        return
+
+    if not message.from_user:
+        return
+
+    if not await is_authorized(message.from_user.id):
+        return
+
+    if len(message.command) < 2:
+        await message.reply_text(
+            "Usage:\n`/open YouTube_URL`"
+        )
+        return
+
+    url = message.text.split(None, 1)[1].strip()
+
+    track = await search_youtube(url)
+
+    if not track:
+        await message.reply_text(
+            "❌ Could not open that URL."
+        )
+        return
+
+    track["video"] = False
+    track["requested_by"] = message.from_user.id
+
+    if is_playing:
+        queue.append(track)
+
+        await message.reply_text(
+            f"📌 Added to queue:\n"
+            f"**{track['title']}**\n"
+            f"Position: `{len(queue)}`"
+        )
+
+    else:
+        await play_track(track)
+
+        await message.reply_text(
+            f"▶️ Playing:\n**{track['title']}**"
+        )
+
+
+# ============================================================
+# /skip
+# ============================================================
+
+@app.on_message(filters.command("skip"))
+async def skip_command(_, message: Message):
+
+    global current_track, is_playing
+
+    if not await ensure_group(message):
+        return
+
+    if not message.from_user:
+        return
+
+    if not await is_authorized(message.from_user.id):
+        return
+
+    if not is_playing:
+        await message.reply_text(
+            "❌ Nothing is playing."
+        )
+        return
+
+    try:
+        await call_py.leave_call(GROUP_ID)
     except Exception:
         pass
 
+    current_track = None
+    is_playing = False
 
-# ============================================================
-# BUTTON STOP
-# ============================================================
-
-@app.on_callback_query(
-    filters.regex(
-        "^music_stop$"
-    )
-)
-async def button_stop(
-    client,
-    query: CallbackQuery
-):
-    if (
-        not query.message
-        or query.message.chat.id != GROUP_ID
-    ):
-        return
-
-    if not await is_authorized(
-        query.from_user.id
-    ):
-        await query.answer(
-            "You are not authorized.",
-            show_alert=True
-        )
-        return
-
-    await query.answer(
-        "Stopping..."
+    await message.reply_text(
+        "⏭ **Skipped!**"
     )
 
-    await stop_all()
+    await asyncio.sleep(0.5)
+
+    await play_next()
+
+
+# ============================================================
+# /stop
+# ============================================================
+
+@app.on_message(filters.command("stop"))
+async def stop_command(_, message: Message):
+
+    global current_track, is_playing
+
+    if not await ensure_group(message):
+        return
+
+    if not message.from_user:
+        return
+
+    if not await is_authorized(message.from_user.id):
+        return
+
+    queue.clear()
+
+    current_track = None
+    is_playing = False
 
     try:
-        await query.message.edit_caption(
-            "⏹ **VC stopped. Queue cleared.**\n\n"
-            f"{BRAND}"
-        )
-    except Exception:
-        pass
+        await call_py.leave_call(GROUP_ID)
+    except Exception as e:
+        print("LEAVE CALL:", repr(e))
 
-
-# ============================================================
-# /AUTH
-# ============================================================
-
-@app.on_message(
-    filters.command(
-        "auth",
-        prefixes="/"
+    await message.reply_text(
+        "⏹ **Playback stopped.**\n"
+        "🗑 Queue cleared."
     )
-)
-async def auth_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
+
+
+# ============================================================
+# /pause
+# ============================================================
+
+@app.on_message(filters.command("pause"))
+async def pause_command(_, message: Message):
+
+    if not await ensure_group(message):
         return
 
     if not message.from_user:
         return
 
-    if not await is_admin(
-        message.from_user.id
-    ):
+    if not await is_authorized(message.from_user.id):
+        return
+
+    try:
+        await call_py.pause(GROUP_ID)
+
         await message.reply_text(
-            f"❌ Admin only.\n\n{BRAND}"
+            "⏸ **Paused.**"
+        )
+
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Pause failed:\n`{str(e)[:500]}`"
+        )
+
+
+# ============================================================
+# /resume
+# ============================================================
+
+@app.on_message(filters.command("resume"))
+async def resume_command(_, message: Message):
+
+    if not await ensure_group(message):
+        return
+
+    if not message.from_user:
+        return
+
+    if not await is_authorized(message.from_user.id):
+        return
+
+    try:
+        await call_py.resume(GROUP_ID)
+
+        await message.reply_text(
+            "▶️ **Resumed.**"
+        )
+
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Resume failed:\n`{str(e)[:500]}`"
+        )
+
+
+# ============================================================
+# /auth
+# ============================================================
+
+@app.on_message(filters.command("auth"))
+async def auth_command(_, message: Message):
+
+    if not await ensure_group(message):
+        return
+
+    if not message.from_user:
+        return
+
+    if not await is_group_admin(message.from_user.id):
+        await message.reply_text(
+            "❌ Only group admins can authorize users."
         )
         return
 
-    parts = message.text.split(
-        maxsplit=1
-    )
-
-    if len(parts) < 2:
+    if len(message.command) < 2:
         await message.reply_text(
-            (
-                "Usage:\n"
-                "`/auth @username`\n"
-                "`/auth userID`\n\n"
-                f"{BRAND}"
-            )
+            "Usage:\n`/auth USER_ID`"
         )
         return
 
-    user = await resolve_user(
-        parts[1]
-    )
-
-    if not user:
+    try:
+        user_id = int(message.command[1])
+    except ValueError:
         await message.reply_text(
-            f"❌ User not found.\n\n{BRAND}"
+            "❌ Invalid user ID."
         )
         return
 
-    authorized_users.add(
-        user.id
-    )
-
+    authorized_users.add(user_id)
     save_auth()
 
     await message.reply_text(
-        (
-            f"✅ {user_tag(user)} authorized.\n\n"
-            f"{BRAND}"
-        )
+        f"✅ User `{user_id}` authorized."
     )
 
 
 # ============================================================
-# /UNAUTH
+# /unauth
 # ============================================================
 
-@app.on_message(
-    filters.command(
-        "unauth",
-        prefixes="/"
-    )
-)
-async def unauth_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
+@app.on_message(filters.command("unauth"))
+async def unauth_command(_, message: Message):
+
+    if not await ensure_group(message):
         return
 
     if not message.from_user:
         return
 
-    if not await is_admin(
-        message.from_user.id
-    ):
+    if not await is_group_admin(message.from_user.id):
         await message.reply_text(
-            f"❌ Admin only.\n\n{BRAND}"
+            "❌ Only group admins can remove authorization."
         )
         return
 
-    parts = message.text.split(
-        maxsplit=1
-    )
-
-    if len(parts) < 2:
+    if len(message.command) < 2:
         await message.reply_text(
-            (
-                "Usage:\n"
-                "`/unauth @username`\n"
-                "`/unauth userID`\n\n"
-                f"{BRAND}"
-            )
+            "Usage:\n`/unauth USER_ID`"
         )
         return
 
-    user = await resolve_user(
-        parts[1]
-    )
-
-    if not user:
+    try:
+        user_id = int(message.command[1])
+    except ValueError:
         await message.reply_text(
-            f"❌ User not found.\n\n{BRAND}"
+            "❌ Invalid user ID."
         )
         return
 
-    authorized_users.discard(
-        user.id
-    )
-
+    authorized_users.discard(user_id)
     save_auth()
 
     await message.reply_text(
-        (
-            f"🚫 {user_tag(user)} unauthorized.\n\n"
-            f"{BRAND}"
-        )
+        f"✅ User `{user_id}` unauthorized."
     )
 
 
 # ============================================================
-# /RELOAD
+# /reload
 # ============================================================
 
-@app.on_message(
-    filters.command(
-        "reload",
-        prefixes="/"
-    )
-)
-async def reload_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
+@app.on_message(filters.command("reload"))
+async def reload_command(_, message: Message):
+
+    if not await ensure_group(message):
         return
 
     if not message.from_user:
         return
 
-    if not await is_admin(
-        message.from_user.id
-    ):
-        await message.reply_text(
-            f"❌ Admin only.\n\n{BRAND}"
-        )
+    if not await is_group_admin(message.from_user.id):
         return
 
     load_auth()
-    await refresh_admins()
 
     await message.reply_text(
-        (
-            "🔄 **Reload complete.**\n\n"
-            f"👑 Admins: `{len(admin_cache)}`\n"
-            f"🔐 Authorized: `{len(authorized_users)}`\n\n"
-            f"{BRAND}"
-        )
+        "🔄 **Authorization database reloaded.**"
     )
 
 
 # ============================================================
-# /PURGE
+# /purge
 # ============================================================
 
-@app.on_message(
-    filters.command(
-        "purge",
-        prefixes="/"
-    )
-)
-async def purge_command(
-    client,
-    message: Message
-):
-    if not allowed_group(message):
+@app.on_message(filters.command("purge"))
+async def purge_command(_, message: Message):
+
+    if not await ensure_group(message):
         return
 
     if not message.from_user:
         return
 
-    if not await is_admin(
-        message.from_user.id
-    ):
+    if not await is_group_admin(message.from_user.id):
+        return
+
+    queue.clear()
+
+    global current_track, is_playing
+
+    current_track = None
+    is_playing = False
+
+    try:
+        await call_py.leave_call(GROUP_ID)
+    except Exception:
+        pass
+
+    await message.reply_text(
+        "🧹 **Queue purged and VC stopped.**"
+    )
+
+
+# ============================================================
+# /queue
+# ============================================================
+
+@app.on_message(filters.command("queue"))
+async def queue_command(_, message: Message):
+
+    if not await ensure_group(message):
+        return
+
+    if not queue:
         await message.reply_text(
-            f"❌ Admin only.\n\n{BRAND}"
+            "📭 Queue is empty."
         )
         return
 
-    if not message.reply_to_message:
-        await message.reply_text(
-            (
-                "Reply to the message where purge "
-                "should start and send `/purge`.\n\n"
-                f"{BRAND}"
+    lines = ["🎵 **Current Queue**\n"]
+
+    for i, track in enumerate(queue, start=1):
+        title = track["title"]
+
+        if len(title) > 50:
+            title = title[:47] + "..."
+
+        lines.append(
+            f"`{i}.` {title}"
+        )
+
+        if i >= 15:
+            lines.append(
+                f"\n...and {len(queue) - 15} more."
             )
+            break
+
+    await message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+@app.on_callback_query(filters.regex("^skip$"))
+async def skip_callback(_, query: CallbackQuery):
+
+    if not query.from_user:
+        return
+
+    if not await is_authorized(query.from_user.id):
+        await query.answer(
+            "Not authorized.",
+            show_alert=True,
         )
         return
 
-    start_id = (
-        message.reply_to_message.id
+    try:
+        await call_py.leave_call(GROUP_ID)
+    except Exception:
+        pass
+
+    global current_track, is_playing
+
+    current_track = None
+    is_playing = False
+
+    await query.answer(
+        "Skipped!"
     )
 
-    end_id = message.id
+    await play_next()
 
-    message_ids = list(
-        range(
-            start_id,
-            end_id + 1
+
+@app.on_callback_query(filters.regex("^stop$"))
+async def stop_callback(_, query: CallbackQuery):
+
+    if not query.from_user:
+        return
+
+    if not await is_authorized(query.from_user.id):
+        await query.answer(
+            "Not authorized.",
+            show_alert=True,
         )
+        return
+
+    queue.clear()
+
+    global current_track, is_playing
+
+    current_track = None
+    is_playing = False
+
+    try:
+        await call_py.leave_call(GROUP_ID)
+    except Exception:
+        pass
+
+    await query.answer(
+        "Stopped!"
     )
-
-    for i in range(
-        0,
-        len(message_ids),
-        100
-    ):
-        chunk = message_ids[
-            i:i + 100
-        ]
-
-        try:
-            await client.delete_messages(
-                GROUP_ID,
-                chunk
-            )
-        except Exception as e:
-            print(
-                "Purge error:",
-                e
-            )
 
 
 # ============================================================
@@ -1756,86 +977,81 @@ async def purge_command(
 # ============================================================
 
 async def startup():
-    await refresh_admins()
+
+    print("=" * 60)
+    print("EPIC INDIA MUSIC BOT")
+    print("=" * 60)
+
+    print("Starting BOT client...")
+    await app.start()
+
+    print("Starting USER client...")
+    await user_app.start()
+
+    me = await user_app.get_me()
 
     print(
-        "========================================"
-    )
-    print(
-        " EPIC INDIA MUSIC BOT"
-    )
-    print(
-        " py-tgcalls / PyTgCalls"
-    )
-    print(
-        "========================================"
+        f"VC USER: {me.first_name} "
+        f"(@{me.username if me.username else 'no_username'})"
     )
 
-    print(
-        "GROUP:",
-        GROUP_ID
-    )
+    print("Starting PyTgCalls...")
+    await call_py.start()
 
-    print(
-        "ADMINS:",
-        len(admin_cache)
-    )
+    print("PyTgCalls started successfully.")
+    print(f"GROUP_ID: {GROUP_ID}")
+    print(f"AUTHORIZED USERS: {len(authorized_users)}")
 
-    print(
-        "AUTHORIZED:",
-        len(authorized_users)
-    )
-
-    print(
-        "BOT READY"
-    )
+    print("=" * 60)
+    print("BOT IS ONLINE")
+    print("=" * 60)
 
 
-# ============================================================
-# RUN
-# ============================================================
+async def shutdown():
 
-if __name__ == "__main__":
-
-    app.start()
-
-    loop = asyncio.get_event_loop()
+    print("Stopping bot...")
 
     try:
-        loop.run_until_complete(
-            startup()
-        )
+        await call_py.leave_call(GROUP_ID)
+    except Exception:
+        pass
 
-        # py-tgcalls
-        call_py.start()
+    try:
+        await call_py.stop()
+    except Exception:
+        pass
 
-        print(
-            "PyTgCalls started."
-        )
+    try:
+        await user_app.stop()
+    except Exception:
+        pass
 
-        idle()
+    try:
+        await app.stop()
+    except Exception:
+        pass
+
+    print("Bot stopped.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+
+    await startup()
+
+    try:
+        # Keep process alive.
+        await asyncio.Event().wait()
 
     except KeyboardInterrupt:
-        print(
-            "Stopping..."
-        )
+        pass
 
     finally:
+        await shutdown()
 
-        try:
-            loop.run_until_complete(
-                stop_all()
-            )
-        except Exception:
-            pass
 
-        try:
-            call_py.stop()
-        except Exception:
-            pass
-
-        try:
-            app.stop()
-        except Exception:
-            pass
-
+if __name__ == "__main__":
+    asyncio.run(main())
